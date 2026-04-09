@@ -344,7 +344,15 @@ async function handleRagIngest(request, env, corsOrigin) {
 
   // Embed all texts in a single Workers AI call (BGE supports batch input)
   const texts = chunks.map(c => String(c.text || ''));
-  const embedResult = await env.AI.run('@cf/baai/bge-base-en-v1.5', { text: texts });
+  let embedResult;
+  try {
+    embedResult = await env.AI.run('@cf/baai/bge-base-en-v1.5', { text: texts });
+  } catch (aiErr) {
+    return jsonResponse(503, {
+      error: 'Workers AI embedding failed',
+      detail: String(aiErr.message || aiErr),
+    }, corsOrigin);
+  }
   const vectors = embedResult.data || embedResult.embeddings || [];
   if (vectors.length !== chunks.length) {
     return jsonResponse(500, {
@@ -361,7 +369,15 @@ async function handleRagIngest(request, env, corsOrigin) {
     metadata: c.metadata || {},
   }));
 
-  const result = await env.VECTORIZE.upsert(toUpsert);
+  let result;
+  try {
+    result = await env.VECTORIZE.upsert(toUpsert);
+  } catch (vecErr) {
+    return jsonResponse(503, {
+      error: 'Vectorize upsert failed',
+      detail: String(vecErr.message || vecErr),
+    }, corsOrigin);
+  }
   return jsonResponse(200, {
     ok: true,
     upserted: toUpsert.length,
@@ -391,7 +407,15 @@ async function handleRagSearch(request, env, corsOrigin) {
   if (body.author) filter.author = { $eq: body.author };
 
   // Embed the query
-  const embed = await env.AI.run('@cf/baai/bge-base-en-v1.5', { text: [query] });
+  let embed;
+  try {
+    embed = await env.AI.run('@cf/baai/bge-base-en-v1.5', { text: [query] });
+  } catch (aiErr) {
+    return jsonResponse(503, {
+      error: 'Workers AI embedding failed (quota may be exhausted)',
+      detail: String(aiErr.message || aiErr),
+    }, corsOrigin);
+  }
   const qVec = (embed.data || embed.embeddings || [])[0];
   if (!qVec) {
     return jsonResponse(500, { error: 'Failed to embed query' }, corsOrigin);
@@ -405,7 +429,15 @@ async function handleRagSearch(request, env, corsOrigin) {
   };
   if (Object.keys(filter).length > 0) searchOpts.filter = filter;
 
-  const result = await env.VECTORIZE.query(qVec, searchOpts);
+  let result;
+  try {
+    result = await env.VECTORIZE.query(qVec, searchOpts);
+  } catch (vecErr) {
+    return jsonResponse(503, {
+      error: 'Vectorize query failed',
+      detail: String(vecErr.message || vecErr),
+    }, corsOrigin);
+  }
   const matches = (result.matches || []).map(m => ({
     id: m.id,
     score: m.score,
@@ -429,14 +461,15 @@ async function handleRagChat(request, env, corsOrigin) {
   }
   const body = await request.json();
   const { messages, teachingContext, handbookContext, glossaryContext, kabirContext } = body;
-  // namespace: 'sufi-library' (public, default), 'hik' (admin), 'all' (admin), 'none' (skip vector search)
+  // namespace: 'sufi-library' (public, default), 'hik'/'hik-online'/'ruhaniat'/'sufi-message'/'sufi-canada' (admin), 'all' (admin), 'none' (skip vector search)
   const namespace = body.namespace || 'sufi-library';
+  const ADMIN_NAMESPACES = ['hik', 'hik-online', 'ruhaniat', 'sufi-message', 'sufi-canada', 'all'];
   if (!messages || !messages.length) {
     return jsonResponse(400, { error: 'No messages provided' }, corsOrigin);
   }
 
-  // Server-side admin gate for HIK content
-  if (namespace === 'hik' || namespace === 'all') {
+  // Server-side admin gate for non-public namespaces
+  if (ADMIN_NAMESPACES.includes(namespace)) {
     const authHeader = request.headers.get('Authorization') || '';
     const token = authHeader.replace('Bearer ', '');
     if (!token || token !== env.AUTH_TOKEN) {
