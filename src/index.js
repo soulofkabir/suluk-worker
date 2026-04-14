@@ -560,23 +560,45 @@ IMPORTANT RULES:
     generationConfig: { temperature: 0.6, maxOutputTokens: 2048 },
   };
 
-  const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${env.GEMINI_API_KEY}`;
-  const geminiResp = await fetch(geminiUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(geminiBody),
-  });
+  // Try models in order: Flash (preferred) → Flash-Lite → 1.5 Flash
+  // Each model gets one retry on 503. This absorbs transient Google demand spikes.
+  const modelChain = ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-1.5-flash'];
+  let geminiData = null;
+  let lastErrText = '';
+  let lastStatus = 500;
+  let modelUsed = null;
 
-  if (!geminiResp.ok) {
-    const errText = await geminiResp.text();
-    return jsonResponse(geminiResp.status, { error: 'Gemini API error', details: errText }, corsOrigin);
+  outer: for (const model of modelChain) {
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${env.GEMINI_API_KEY}`;
+      const geminiResp = await fetch(geminiUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(geminiBody),
+      });
+      if (geminiResp.ok) {
+        geminiData = await geminiResp.json();
+        modelUsed = model;
+        break outer;
+      }
+      lastStatus = geminiResp.status;
+      lastErrText = await geminiResp.text();
+      // Only retry / fall through on transient 5xx (overload, unavailable)
+      if (geminiResp.status < 500 || geminiResp.status === 501) break outer;
+      // Short backoff before retrying the same model
+      if (attempt === 1) await new Promise(r => setTimeout(r, 500));
+    }
   }
 
-  const geminiData = await geminiResp.json();
+  if (!geminiData) {
+    return jsonResponse(lastStatus, { error: 'Gemini API error', details: lastErrText }, corsOrigin);
+  }
+
   const reply = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || 'No response generated.';
 
   return jsonResponse(200, {
     reply,
+    modelUsed,
     corpusMatches: corpusMatches.slice(0, 10).map(m => ({
       book: m.book,
       author: m.author,
