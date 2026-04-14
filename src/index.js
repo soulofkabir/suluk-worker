@@ -461,9 +461,9 @@ async function handleRagChat(request, env, corsOrigin) {
   }
   const body = await request.json();
   const { messages, teachingContext, handbookContext, glossaryContext, kabirContext } = body;
-  // namespace: 'sufi-library' (public, default), 'hik'/'hik-online'/'ruhaniat'/'sufi-message'/'sufi-canada' (admin), 'all' (admin), 'none' (skip vector search)
+  // namespace: 'sufi-library' (public, default), 'hik'/'hik-online'/'ruhaniat'/'sufi-message'/'sufi-canada'/'hik-message'/'pir-vilayat'/'suluk-classes' (admin), 'all' (admin), 'none' (skip vector search)
   const namespace = body.namespace || 'sufi-library';
-  const ADMIN_NAMESPACES = ['hik', 'hik-online', 'ruhaniat', 'sufi-message', 'sufi-canada', 'all'];
+  const ADMIN_NAMESPACES = ['hik', 'hik-online', 'ruhaniat', 'sufi-message', 'sufi-canada', 'hik-message', 'pir-vilayat', 'suluk-classes', 'all'];
   if (!messages || !messages.length) {
     return jsonResponse(400, { error: 'No messages provided' }, corsOrigin);
   }
