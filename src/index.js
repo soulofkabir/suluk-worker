@@ -583,9 +583,13 @@ IMPORTANT RULES:
       }
       lastStatus = geminiResp.status;
       lastErrText = await geminiResp.text();
-      // Only retry / fall through on transient 5xx (overload, unavailable)
-      if (geminiResp.status < 500 || geminiResp.status === 501) break outer;
-      // Short backoff before retrying the same model
+      // Fall through on transient 5xx (overload, unavailable) OR 429 (free-tier quota)
+      // Hard 4xx (400, 401, 403, etc.) are real errors — don't retry.
+      const isRetryable = geminiResp.status === 429 || (geminiResp.status >= 500 && geminiResp.status !== 501);
+      if (!isRetryable) break outer;
+      // For 429 quota errors, skip straight to the next model (same model won't recover)
+      if (geminiResp.status === 429) break;
+      // For 5xx, short backoff before retrying the same model
       if (attempt === 1) await new Promise(r => setTimeout(r, 500));
     }
   }
