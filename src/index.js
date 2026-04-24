@@ -461,9 +461,11 @@ async function handleRagChat(request, env, corsOrigin) {
   }
   const body = await request.json();
   const { messages, teachingContext, handbookContext, glossaryContext, kabirContext } = body;
-  // namespace: 'sufi-library' (public, default), 'hik'/'hik-online'/'ruhaniat'/'sufi-message'/'sufi-canada'/'hik-message'/'pir-vilayat'/'suluk-classes' (admin), 'all' (admin), 'none' (skip vector search)
+  // namespace: 'sufi-library' (public, default), 'hik'/'hik-online'/'ruhaniat'/'sufi-message'/'sufi-canada'/'hik-message'/'pir-vilayat'/'suluk-classes' (admin), 'hik-all' (admin, HIK-only compound: hik+hik-online+hik-message), 'all' (admin), 'none' (skip vector search)
   const namespace = body.namespace || 'sufi-library';
-  const ADMIN_NAMESPACES = ['hik', 'hik-online', 'ruhaniat', 'sufi-message', 'sufi-canada', 'hik-message', 'pir-vilayat', 'suluk-classes', 'all'];
+  const ADMIN_NAMESPACES = ['hik', 'hik-online', 'ruhaniat', 'sufi-message', 'sufi-canada', 'hik-message', 'pir-vilayat', 'suluk-classes', 'hik-all', 'all'];
+  // Compound namespace: hik-all restricts to the three HIK vector namespaces only.
+  const HIK_ONLY = namespace === 'hik-all';
   if (!messages || !messages.length) {
     return jsonResponse(400, { error: 'No messages provided' }, corsOrigin);
   }
@@ -492,8 +494,12 @@ async function handleRagChat(request, env, corsOrigin) {
         returnMetadata: 'all',
         returnValues: false,
       };
-      // 'all' = no namespace filter; otherwise filter to the requested namespace
-      if (namespace !== 'all') searchOpts.filter = { namespace: { $eq: namespace } };
+      // 'all' = no namespace filter; 'hik-all' = HIK compound; otherwise single namespace
+      if (HIK_ONLY) {
+        searchOpts.filter = { namespace: { $in: ['hik', 'hik-online', 'hik-message'] } };
+      } else if (namespace !== 'all') {
+        searchOpts.filter = { namespace: { $eq: namespace } };
+      }
       try {
         const res = await env.VECTORIZE.query(qVec, searchOpts);
         corpusMatches = (res.matches || []).map(m => ({
@@ -517,37 +523,51 @@ async function handleRagChat(request, env, corsOrigin) {
     });
   }
 
+  // In HIK-only mode, suppress handbook + kabir context entirely (defense in depth;
+  // the client already omits them, but never trust the client).
+  const effectiveHandbook = HIK_ONLY ? null : handbookContext;
+  const effectiveKabir    = HIK_ONLY ? null : kabirContext;
+
   // Build handbook excerpts (existing behaviour preserved)
   let teachingExcerpts = '';
-  if (handbookContext && handbookContext.length) {
+  if (effectiveHandbook && effectiveHandbook.length) {
     teachingExcerpts = '\n\n--- RELEVANT TEACHINGS FROM THE HANDBOOK ---\n';
-    handbookContext.forEach((t, i) => {
+    effectiveHandbook.forEach((t, i) => {
       teachingExcerpts += `\n[H${i + 1}] "${t.title}" (${t.chapter}${t.instructor ? ', ' + t.instructor : ''})\n${t.body}\n`;
     });
   }
 
   let currentTeaching = '';
-  if (teachingContext) {
+  if (teachingContext && !HIK_ONLY) {
     currentTeaching = `\n\n--- CURRENTLY READING ---\nTitle: ${teachingContext.title}\nChapter: ${teachingContext.chapter}\nInstructor: ${teachingContext.instructor || ''}\nContent: ${teachingContext.body?.slice(0, 2000) || ''}`;
   }
 
-  const systemPrompt = `You are a study companion for a Suluk Academy practitioner with deep access to three knowledge sources:
-
+  // Source-scope description for the system prompt
+  const sourceDescription = HIK_ONLY
+    ? `You answer strictly from the Knowledge Library passages below — Hazrat Inayat Khan's Complete Works and related primary-source writings. No handbook notes, no personal reflections — only HIK's own words and the scholarly commentary that is part of the Library.`
+    : `You have access to three knowledge sources:
 1. The Suluk Digital Handbook (your primary Inayatiyya teaching reference)
 2. Kabir's personal contemplative writings (reflections, Crimson Heart, Light Dreaming, Journey of Light)
-3. The Knowledge Library — Hazrat Inayat Khan's Complete Works + other Sufi literature
+3. The Knowledge Library — Hazrat Inayat Khan's Complete Works + other Sufi literature`;
+
+  const systemPrompt = `You are a study companion for a Suluk Academy practitioner.
+
+${sourceDescription}
+
+WRITING STYLE:
+- Address the student as "Dear Mureed" where natural; close with a blessing or brief invocation.
+- Write in flowing, reverent prose. Short paragraphs. No bulleted lists unless the student asks for steps.
+- Do NOT print inline citations in the answer text. No bracket tags like [L1], [H1], [K1]. No parenthetical book names or page numbers. No " — Source X — Chapter Y" attributions mid-sentence. The Sources panel below the answer handles all attribution — inline citations would duplicate it and clutter the reading.
+- You may name a book or author in the prose ONLY when the student explicitly asks "who said this" or "what book is this from". Otherwise, let the prose read as your own synthesis of the passages.
+- Direct quotations are welcome — place them in double quotes without a trailing citation.
 
 IMPORTANT RULES:
-1. Ground every answer in the provided passages. Quote or paraphrase and cite the source.
-2. Citation format: use the bracket tags from the context ([L1], [H1], [K1]) followed by the source name. Example: "[L3] The Inner Life, ch. 4".
-3. When a passage from the Knowledge Library (L) directly answers the question, lead with that. The library is the most authoritative source for HIK's own words.
-4. When Kabir's writings (K) add a personal or reflective angle, weave them in.
-5. When the Handbook (H) applies, use it for Suluk Academy specific framing.
-6. If NONE of the provided passages are relevant, say so plainly — do not invent.
-7. Be respectful and reverent toward the teachings and the Inayatiyya lineage.
-8. When discussing practices, note that proper guidance from a teacher is important.` + currentTeaching + corpusExcerpts + teachingExcerpts +
-    (kabirContext && kabirContext.length ? '\n\n--- KABIR\'S WRITINGS (personal reflections) ---\n' + kabirContext.map((k, i) => `\n[K${i + 1}] "${k.title}" (${k.source || "Kabir's Writings"})\n${k.body}\n`).join('') : '') +
-    (glossaryContext && glossaryContext.length ? '\n\n--- GLOSSARY TERMS ---\n' + glossaryContext.map(g => `- **${g.term}**: ${g.definition}`).join('\n') : '');
+1. Ground every answer in the provided passages. If the passages do not address the question, say so plainly — do not invent.
+2. Be respectful and reverent toward the teachings and the Inayatiyya lineage.
+3. When discussing practices, note that proper guidance from a teacher is important.
+4. Keep the answer focused. 2-5 short paragraphs is usually enough.` + currentTeaching + corpusExcerpts + teachingExcerpts +
+    (effectiveKabir && effectiveKabir.length ? '\n\n--- KABIR\'S WRITINGS (personal reflections) ---\n' + effectiveKabir.map((k, i) => `\n[K${i + 1}] "${k.title}" (${k.source || "Kabir's Writings"})\n${k.body}\n`).join('') : '') +
+    (glossaryContext && glossaryContext.length && !HIK_ONLY ? '\n\n--- GLOSSARY TERMS ---\n' + glossaryContext.map(g => `- **${g.term}**: ${g.definition}`).join('\n') : '');
 
   const geminiMessages = messages.map(m => ({
     role: m.role === 'assistant' ? 'model' : 'user',
