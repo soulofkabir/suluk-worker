@@ -490,7 +490,7 @@ async function handleRagChat(request, env, corsOrigin) {
     const qVec = (embed.data || embed.embeddings || [])[0];
     if (qVec) {
       const searchOpts = {
-        topK: 10,
+        topK: 15,
         returnMetadata: 'all',
         returnValues: false,
       };
@@ -523,51 +523,26 @@ async function handleRagChat(request, env, corsOrigin) {
     });
   }
 
-  // In HIK-only mode, suppress handbook + kabir context entirely (defense in depth;
-  // the client already omits them, but never trust the client).
-  const effectiveHandbook = HIK_ONLY ? null : handbookContext;
-  const effectiveKabir    = HIK_ONLY ? null : kabirContext;
+  // The companion now draws exclusively from the vector Knowledge Library.
+  // Any handbookContext / kabirContext / teachingContext / glossaryContext in
+  // the request body is ignored — those sources are reserved for the user's
+  // private reading experience and must never leak into AI answers.
 
-  // Build handbook excerpts (existing behaviour preserved)
-  let teachingExcerpts = '';
-  if (effectiveHandbook && effectiveHandbook.length) {
-    teachingExcerpts = '\n\n--- RELEVANT TEACHINGS FROM THE HANDBOOK ---\n';
-    effectiveHandbook.forEach((t, i) => {
-      teachingExcerpts += `\n[H${i + 1}] "${t.title}" (${t.chapter}${t.instructor ? ', ' + t.instructor : ''})\n${t.body}\n`;
-    });
-  }
-
-  let currentTeaching = '';
-  if (teachingContext && !HIK_ONLY) {
-    currentTeaching = `\n\n--- CURRENTLY READING ---\nTitle: ${teachingContext.title}\nChapter: ${teachingContext.chapter}\nInstructor: ${teachingContext.instructor || ''}\nContent: ${teachingContext.body?.slice(0, 2000) || ''}`;
-  }
-
-  // Source-scope description for the system prompt
-  const sourceDescription = HIK_ONLY
-    ? `You answer strictly from the Knowledge Library passages below — Hazrat Inayat Khan's Complete Works and related primary-source writings. No handbook notes, no personal reflections — only HIK's own words and the scholarly commentary that is part of the Library.`
-    : `You have access to three knowledge sources:
-1. The Suluk Digital Handbook (your primary Inayatiyya teaching reference)
-2. Kabir's personal contemplative writings (reflections, Crimson Heart, Light Dreaming, Journey of Light)
-3. The Knowledge Library — Hazrat Inayat Khan's Complete Works + other Sufi literature`;
-
-  const systemPrompt = `You are a study companion for a Suluk Academy practitioner.
-
-${sourceDescription}
+  const systemPrompt = `You are a study companion for a Suluk Academy practitioner. Your only knowledge source is the Knowledge Library passages provided below — drawn from the Complete Works of Hazrat Inayat Khan, the Ruhaniat papers of Murshid Samuel Lewis and HIK's esoteric writings, Pir Vilayat's teachings, and related Sufi literature.
 
 WRITING STYLE:
 - Address the student as "Dear Mureed" where natural; close with a blessing or brief invocation.
-- Write in flowing, reverent prose. Short paragraphs. No bulleted lists unless the student asks for steps.
-- Do NOT print inline citations in the answer text. No bracket tags like [L1], [H1], [K1]. No parenthetical book names or page numbers. No " — Source X — Chapter Y" attributions mid-sentence. The Sources panel below the answer handles all attribution — inline citations would duplicate it and clutter the reading.
-- You may name a book or author in the prose ONLY when the student explicitly asks "who said this" or "what book is this from". Otherwise, let the prose read as your own synthesis of the passages.
-- Direct quotations are welcome — place them in double quotes without a trailing citation.
+- Write in flowing, reverent prose. Use 4-8 paragraphs for most questions — enough to develop the teaching with nuance. Short only when the question is genuinely simple.
+- Draw together multiple passages when they illuminate the same theme. Synthesis is the gift you bring; a single excerpt is rarely enough.
+- Direct quotations from HIK are welcome — place them in double quotes.
+- Do NOT print inline citations in the answer text. No bracket tags like [L1]. No parenthetical book names, no page numbers, no " — Source X — Chapter Y" attributions mid-sentence. Let the prose read as flowing transmission rather than a research paper. You may name Hazrat Inayat Khan, Murshid Samuel Lewis, or Pir Vilayat when ascribing direct quotations to them, but never add the book title or page.
+- Do NOT end the answer with a "Sources" list or any reference block — the system does not display sources.
 
 IMPORTANT RULES:
 1. Ground every answer in the provided passages. If the passages do not address the question, say so plainly — do not invent.
 2. Be respectful and reverent toward the teachings and the Inayatiyya lineage.
 3. When discussing practices, note that proper guidance from a teacher is important.
-4. Keep the answer focused. 2-5 short paragraphs is usually enough.` + currentTeaching + corpusExcerpts + teachingExcerpts +
-    (effectiveKabir && effectiveKabir.length ? '\n\n--- KABIR\'S WRITINGS (personal reflections) ---\n' + effectiveKabir.map((k, i) => `\n[K${i + 1}] "${k.title}" (${k.source || "Kabir's Writings"})\n${k.body}\n`).join('') : '') +
-    (glossaryContext && glossaryContext.length && !HIK_ONLY ? '\n\n--- GLOSSARY TERMS ---\n' + glossaryContext.map(g => `- **${g.term}**: ${g.definition}`).join('\n') : '');
+4. Give a thorough, precise answer. Do not truncate to save length; develop the teaching until the question is fully answered.` + corpusExcerpts;
 
   const geminiMessages = messages.map(m => ({
     role: m.role === 'assistant' ? 'model' : 'user',
@@ -577,7 +552,7 @@ IMPORTANT RULES:
   const geminiBody = {
     system_instruction: { parts: [{ text: systemPrompt }] },
     contents: geminiMessages,
-    generationConfig: { temperature: 0.6, maxOutputTokens: 2048 },
+    generationConfig: { temperature: 0.6, maxOutputTokens: 8192 },
   };
 
   // Try models in order: Flash (preferred) → Flash-Lite → 1.5 Flash
