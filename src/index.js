@@ -483,34 +483,101 @@ async function handleRagChat(request, env, corsOrigin) {
   const lastUser = [...messages].reverse().find(m => m.role === 'user');
   const retrievalQuery = (lastUser?.content || '').trim();
 
-  // Run vector search against the corpus (skip when namespace='none')
+  // Build the vector search filter once
+  const buildFilter = () => {
+    if (HIK_ONLY) return { namespace: { $in: ['hik', 'hik-online', 'hik-message'] } };
+    if (namespace !== 'all') return { namespace: { $eq: namespace } };
+    return undefined;
+  };
+
+  // Multi-query retrieval: expand the user's question into 3-4 related search
+  // queries, then union the results. This rescues recall for procedural chunks
+  // that don't share vocabulary with the user's question (e.g. a query about
+  // "Mental Purification" cannot retrieve the 1925 Summerschool "20 Purification
+  // Breaths" transcript, which never uses the word "mental" — but it matches
+  // an expansion like "Purification Breaths instructions").
   let corpusMatches = [];
   if (retrievalQuery && namespace !== 'none') {
-    const embed = await env.AI.run('@cf/baai/bge-base-en-v1.5', { text: [retrievalQuery] });
-    const qVec = (embed.data || embed.embeddings || [])[0];
-    if (qVec) {
-      const searchOpts = {
-        topK: 15,
-        returnMetadata: 'all',
-        returnValues: false,
-      };
-      // 'all' = no namespace filter; 'hik-all' = HIK compound; otherwise single namespace
-      if (HIK_ONLY) {
-        searchOpts.filter = { namespace: { $in: ['hik', 'hik-online', 'hik-message'] } };
-      } else if (namespace !== 'all') {
-        searchOpts.filter = { namespace: { $eq: namespace } };
+    // Start with the original query. Ask Gemini Flash-Lite for up to 3 expansions.
+    const queries = [retrievalQuery];
+    try {
+      const expandPrompt = `You are a search-query expander for a retrieval system over Hazrat Inayat Khan's Sufi corpus (Complete Works, Ruhaniat papers, Samuel Lewis commentaries, Pir Vilayat teachings, class transcripts).
+
+Given a student's question, produce 2-3 alternative search queries that would retrieve DIFFERENT relevant passages the original query might miss. Focus on:
+- Specific practice names the question implies but doesn't state (e.g. Nayaz, Purification Breaths, Ya Latif, Wazifa, Fikr, Qasab, Darood, Zikr, Dharana, Sarmad, Mansur)
+- Procedural vocabulary ("instructions", "step by step", "rhythm", "inhale exhale", "nose mouth")
+- Synonyms and lineage-specific terms (e.g. "mureed", "murshid", "samadhi", "nafs", "samskara")
+- Related concepts that might sit in a different chapter
+
+Output ONLY a JSON array of strings. No prose, no preamble. 2-3 items. Keep each under 12 words.
+
+Student question: ${retrievalQuery}
+
+JSON array:`;
+      const expandResp = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${env.GEMINI_API_KEY}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ role: 'user', parts: [{ text: expandPrompt }] }],
+            generationConfig: { temperature: 0.3, maxOutputTokens: 256 },
+          }),
+        }
+      );
+      if (expandResp.ok) {
+        const ed = await expandResp.json();
+        let raw = ed.candidates?.[0]?.content?.parts?.[0]?.text || '';
+        // Strip code fences if present
+        raw = raw.replace(/```(?:json)?\s*/g, '').replace(/```\s*$/g, '').trim();
+        const match = raw.match(/\[[\s\S]*\]/);
+        if (match) {
+          try {
+            const arr = JSON.parse(match[0]);
+            if (Array.isArray(arr)) {
+              for (const q of arr) {
+                if (typeof q === 'string' && q.trim() && queries.length < 4) {
+                  queries.push(q.trim());
+                }
+              }
+            }
+          } catch (_) { /* ignore parse error — fall back to single query */ }
+        }
       }
+    } catch (_) { /* ignore expansion failure — fall back to single query */ }
+
+    // Batch-embed all queries in one Workers AI call (BGE supports batch input)
+    let allVecs = [];
+    try {
+      const embed = await env.AI.run('@cf/baai/bge-base-en-v1.5', { text: queries });
+      allVecs = embed.data || embed.embeddings || [];
+    } catch (_) { allVecs = []; }
+
+    // Run parallel Vectorize queries (each topK=10) and merge by chunk_id,
+    // keeping the best score per chunk.
+    const filter = buildFilter();
+    const byId = new Map();
+    await Promise.all(allVecs.map(async (qVec, idx) => {
+      if (!qVec) return;
+      const searchOpts = { topK: 10, returnMetadata: 'all', returnValues: false };
+      if (filter) searchOpts.filter = filter;
       try {
         const res = await env.VECTORIZE.query(qVec, searchOpts);
-        corpusMatches = (res.matches || []).map(m => ({
-          score: m.score,
-          ...m.metadata,
-        }));
-      } catch (e) {
-        // If Vectorize query fails, degrade gracefully to normal chat
-        corpusMatches = [];
-      }
-    }
+        for (const m of res.matches || []) {
+          const prev = byId.get(m.id);
+          // A boost for the original query (idx=0) since it's the most targeted;
+          // expansions get their raw score.
+          const score = idx === 0 ? m.score * 1.05 : m.score;
+          if (!prev || score > prev.score) {
+            byId.set(m.id, { score, ...m.metadata });
+          }
+        }
+      } catch (_) { /* swallow per-query failure */ }
+    }));
+
+    corpusMatches = Array.from(byId.values())
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 18);
   }
 
   // Build corpus excerpts block
